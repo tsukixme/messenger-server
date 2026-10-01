@@ -12,6 +12,8 @@ services:
     build: ./auth
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ./data-auth:/data
     depends_on:
       - synapse
 

@@ -8,7 +8,19 @@
   4. Приложение опрашивает GET /auth/status/{id}    -> получает логин и пароль Matrix
   5. Приложение входит в Synapse обычным логином
 
-Данные хранятся в памяти: после перезапуска незавершённые входы сбрасываются (для пилота нормально).
+Сессии и история запросов хранятся в SQLite (файл DB_PATH), поэтому
+переживают перезапуск контейнера.
+
+Изменения по сравнению с первой версией (пилотной, в памяти):
+  - WA_APP_SECRET обязателен, если DEV_MODE выключен: без него сервис не
+    запустится. Раньше при пустом секрете проверка подписи молча
+    пропускалась, и запрос на /auth/webhook принимался без проверки,
+    кто его прислал.
+  - Данные пережили перезапуск (SQLite вместо памяти).
+  - Добавлено простое ограничение числа запросов с одного IP-адреса в
+    /auth/start, отдельно от уже существующего ограничения на номер.
+  - Если Synapse не ответил при выдаче пароля, сессия остаётся
+    подтверждённой и доступной для повторной попытки, а не теряется.
 """
 import hashlib
 import hmac
@@ -16,12 +28,16 @@ import logging
 import os
 import re
 import secrets
+import sys
 import time
+from collections import defaultdict
 from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
+
+from db import Database
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("auth")
@@ -30,6 +46,7 @@ SYNAPSE_URL = os.environ.get("SYNAPSE_URL", "http://synapse:8008")
 SERVER_NAME = os.environ.get("SERVER_NAME", "")
 ADMIN_TOKEN = os.environ.get("SYNAPSE_ADMIN_TOKEN", "")
 DEV_MODE = os.environ.get("DEV_MODE", "false").lower() == "true"
+DB_PATH = os.environ.get("DB_PATH", "/data/auth.db")
 
 WA_BUSINESS_NUMBER = re.sub(r"\D", "", os.environ.get("WA_BUSINESS_NUMBER", ""))
 WA_VERIFY_TOKEN = os.environ.get("WA_VERIFY_TOKEN", "")
@@ -38,11 +55,23 @@ WA_ACCESS_TOKEN = os.environ.get("WA_ACCESS_TOKEN", "")
 WA_PHONE_NUMBER_ID = os.environ.get("WA_PHONE_NUMBER_ID", "")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v22.0")
 
-CODE_TTL = 10 * 60          # код живёт 10 минут
-MAX_STARTS_PER_HOUR = 5     # не больше 5 попыток входа с одного номера в час
+CODE_TTL = 10 * 60             # код живёт 10 минут
+MAX_STARTS_PER_HOUR = 5        # не больше 5 попыток входа с одного номера в час
+MAX_STARTS_PER_IP_HOUR = 30    # и не больше 30 попыток в час с одного IP-адреса, суммарно
 
-sessions: dict[str, dict] = {}       # session_id -> {phone, code, expires, verified}
-starts: dict[str, list[float]] = {}  # phone -> время попыток
+# Без этой проверки подписи сервис принимал бы на /auth/webhook что угодно
+# от кого угодно, выдавая себя за сообщение из WhatsApp. Поэтому секрет
+# обязателен всегда, кроме локальной проверки с DEV_MODE=true.
+if not DEV_MODE and not WA_APP_SECRET:
+    sys.exit(
+        "WA_APP_SECRET не задан. Без него /auth/webhook примет сообщение "
+        "от кого угодно, а не только от WhatsApp. Задайте WA_APP_SECRET в "
+        ".env, или включите DEV_MODE=true только для локальной проверки "
+        "без реального WhatsApp (не для публичного сервера)."
+    )
+
+db = Database(DB_PATH)
+_ip_starts: dict[str, list[float]] = defaultdict(list)  # IP -> времена запросов (только в памяти)
 
 app = FastAPI(title="WhatsApp login for Matrix (pilot)")
 
@@ -50,7 +79,13 @@ app = FastAPI(title="WhatsApp login for Matrix (pilot)")
 # ---------- вспомогательное ----------
 
 def normalize_phone(raw: str) -> str:
-    """'8 701 123-45-67', '+7 701...', '701...' -> '77011234567'."""
+    """'8 701 123-45-67', '+7 701...', '701...' -> '77011234567'.
+
+    Внимание: любые 10 цифр трактуются как номер с кодом 7 (Казахстан/
+    Россия), включая номера других стран такой же длины. Для пилота в
+    Казахстане это приемлемо, но при выходе за пределы СНГ формат нужно
+    будет уточнять по коду страны, а не по одной лишь длине номера.
+    """
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
@@ -61,37 +96,45 @@ def normalize_phone(raw: str) -> str:
     return digits
 
 
-def cleanup() -> None:
+def _check_ip_rate_limit(ip: str) -> None:
+    """Минимальная защита от перегрузки запросами: лимит в памяти, на один процесс.
+
+    Это не замена полноценному rate-limiter (например, при нескольких
+    запущенных копиях сервиса у каждой будет свой счётчик), но для пилота
+    с одним контейнером этого достаточно, чтобы один источник не мог
+    поставить в очередь произвольное количество номеров.
+    """
     now = time.time()
-    for sid in [s for s, v in sessions.items() if v["expires"] < now]:
-        del sessions[sid]
+    recent = [t for t in _ip_starts[ip] if now - t < 3600]
+    if len(recent) >= MAX_STARTS_PER_IP_HOUR:
+        raise HTTPException(429, "Слишком много запросов с этого адреса, попробуйте позже")
+    recent.append(now)
+    _ip_starts[ip] = recent
 
 
-def new_code() -> str:
-    active = {v["code"] for v in sessions.values()}
+def new_code(active: set[str]) -> str:
     while True:
         code = f"{secrets.randbelow(1_000_000):06d}"
         if code not in active:
             return code
 
 
-def handle_incoming(sender: str, text: str) -> bool:
+async def handle_incoming(sender: str, text: str) -> bool:
     """Сообщение пришло в WhatsApp: ищем в нём код и сверяем номер отправителя."""
-    cleanup()
+    await db.cleanup(time.time())
     match = re.search(r"(?<!\d)(\d{6})(?!\d)", text or "")
     if not match:
         return False
     code = match.group(1)
     sender = normalize_phone(sender)
-    for sid, s in sessions.items():
-        if s["code"] == code and not s["verified"]:
-            if s["phone"] == sender:
-                s["verified"] = True
-                log.info("Номер %s подтверждён (сессия %s)", sender, sid[:8])
-                return True
-            log.warning("Код %s пришёл с чужого номера %s", code, sender)
-            return False
-    return False
+    result = await db.mark_verified_by_code(code, sender)
+    if result is None:
+        return False
+    if result == "wrong_phone":
+        log.warning("Код %s пришёл с чужого номера %s", code, sender)
+        return False
+    log.info("Номер %s подтверждён (сессия %s)", sender, result[:8])
+    return True
 
 
 async def ensure_matrix_user(phone: str) -> tuple[str, str]:
@@ -139,18 +182,23 @@ class StartRequest(BaseModel):
 
 
 @app.post("/auth/start")
-async def start(req: StartRequest):
-    cleanup()
-    phone = normalize_phone(req.phone)
+async def start(req: StartRequest, request: Request):
     now = time.time()
-    recent = [t for t in starts.get(phone, []) if now - t < 3600]
-    if len(recent) >= MAX_STARTS_PER_HOUR:
+    await db.cleanup(now)
+    phone = normalize_phone(req.phone)
+
+    client_ip = request.client.host if request.client else "unknown"
+    _check_ip_rate_limit(client_ip)
+
+    recent = await db.count_recent_starts(phone, now - 3600)
+    if recent >= MAX_STARTS_PER_HOUR:
         raise HTTPException(429, "Слишком много попыток, попробуйте через час")
-    starts[phone] = recent + [now]
+    await db.record_start(phone, now)
 
     sid = secrets.token_urlsafe(16)
-    code = new_code()
-    sessions[sid] = {"phone": phone, "code": code, "expires": now + CODE_TTL, "verified": False}
+    active = await db.active_codes()
+    code = new_code(active)
+    await db.create_session(sid, phone, code, now + CODE_TTL, now)
     wa_link = f"https://wa.me/{WA_BUSINESS_NUMBER}?text={quote('Код ' + code)}" if WA_BUSINESS_NUMBER else None
     log.info("Новый вход: +%s, код %s", phone, code)
     return {"session_id": sid, "code": code, "wa_link": wa_link, "expires_in": CODE_TTL}
@@ -158,14 +206,20 @@ async def start(req: StartRequest):
 
 @app.get("/auth/status/{sid}")
 async def status(sid: str):
-    cleanup()
-    s = sessions.get(sid)
+    await db.cleanup(time.time())
+    s = await db.get_session(sid)
     if not s:
         raise HTTPException(410, "Сессия истекла, начните заново")
     if not s["verified"]:
         return {"verified": False}
-    del sessions[sid]  # логин и пароль выдаются один раз
-    user_id, password = await ensure_matrix_user(s["phone"])
+    try:
+        user_id, password = await ensure_matrix_user(s["phone"])
+    except HTTPException:
+        # Намеренно НЕ удаляем сессию здесь: если Synapse на мгновение
+        # недоступен, подтверждённый номер не должен теряться — приложение
+        # сможет повторить запрос статуса без повторного ввода кода.
+        raise
+    await db.delete_session(sid)  # логин и пароль выдаются один раз
     return {"verified": True, "user_id": user_id, "password": password}
 
 
@@ -195,7 +249,7 @@ async def webhook(request: Request):
                     continue
                 sender = msg.get("from", "")
                 try:
-                    ok = handle_incoming(sender, msg["text"].get("body", ""))
+                    ok = await handle_incoming(sender, msg["text"].get("body", ""))
                 except HTTPException:
                     continue
                 if ok:
@@ -215,7 +269,7 @@ async def dev_message(msg: DevMessage):
     """Имитирует сообщение в WhatsApp. Работает только при DEV_MODE=true."""
     if not DEV_MODE:
         raise HTTPException(404, "Not found")
-    return {"verified": handle_incoming(msg.phone, msg.text)}
+    return {"verified": await handle_incoming(msg.phone, msg.text)}
 
 
 @app.get("/auth/health")
