@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -59,6 +60,47 @@ for service in ('synapse', 'auth'):
         running.append(service)
     if service == 'synapse':
         image = item['Image']
+
+# Estimate an uncompressed tar before stopping writers. The existing Synapse
+# image can read root-owned data; bind mounts are read-only and no network is used.
+estimate_archive = '''
+from pathlib import Path
+import io, os, sys, tarfile
+source = Path(sys.argv[1])
+size = 0
+with tarfile.open(fileobj=io.BytesIO(), mode='w', dereference=False) as archive:
+    def visit(path, name):
+        global size
+        if '.env' in Path(name).parts:
+            return
+        info = archive.gettarinfo(str(path), arcname=name)
+        if info is None:
+            return
+        size += len(info.tobuf(archive.format, archive.encoding, archive.errors))
+        if info.isreg():
+            size += ((info.size + 511) // 512) * 512
+        if info.isdir():
+            with os.scandir(path) as children:
+                names = sorted(child.name for child in children)
+            for child in names:
+                visit(path / child, name + '/' + child)
+    for folder in ('data', 'data-auth'):
+        visit(source / folder, folder)
+print(((size + 1024 + 10239) // 10240) * 10240)
+'''
+estimated = int(subprocess.check_output([
+    'docker', 'run', '--rm', '--pull=never', '--network=none', '--user', '0',
+    '--entrypoint', 'python',
+    '-v', str(project / 'data') + ':/source/data:ro',
+    '-v', str(project / 'data-auth') + ':/source/data-auth:ro',
+    image, '-c', estimate_archive, '/source'
+]))
+required = estimated + max(64 * 1024 * 1024, (estimated + 19) // 20)
+available = shutil.disk_usage(backups).free
+if available < required:
+    os.close(lock_fd)
+    raise SystemExit(f'Not enough free space for backup: need {required} bytes, '
+                     f'available {available}; services were not stopped')
 
 name = 'tildes-S3-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '.tar.gz'
 fd, tmp = tempfile.mkstemp(prefix='.partial-', suffix='.tar.gz', dir=backups)

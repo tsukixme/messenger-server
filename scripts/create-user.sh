@@ -25,6 +25,11 @@ if ! builtin printf '%s' "$task_password" | python3 -c 'import sys; p=sys.stdin.
   exit 1
 fi
 
+[[ ${#task_password} -ge 12 ]] || {
+  echo 'Password must be at least 12 characters; user was not created.' >&2
+  exit 1
+}
+
 builtin printf '%s' "$task_password" |
   docker compose exec -T synapse register_new_matrix_user \
     -c /data/homeserver.yaml -u "$task_login" --no-admin \
