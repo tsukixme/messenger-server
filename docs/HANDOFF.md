@@ -13,6 +13,14 @@
 
 ---
 
+## 2026-10-02 · S4 · Codex
+- Сделано: подготовлены [PR #2 приложения](https://github.com/tsukixme/messenger/pull/2) и [PR #3 сервера](https://github.com/tsukixme/messenger-server/pull/3): один defaultHomeserver, сборочный workflow Claude с явно описанным nightly/rust-src/WASM шагом, точный серверный nginx-web.patch.
+- Проверка: analyze до/после — exit 0, No issues found; Compose config с фиктивным окружением и nginx -t в отдельном контейнере — exit 0. **S4 не принят**: подготовка web остановлена после двух неудач на Windows; тесты не запустились из-за webcrypto/CMake. CI, реальные артефакты, браузер и устройства пока не проверены; runtime web не опубликован. [Отчёт приложения](https://github.com/tsukixme/messenger/blob/ci-builds/docs/reports/S4-codex.md), [отчёт сервера](https://github.com/tsukixme/messenger-server/blob/web-serving/docs/reports/S4-codex.md).
+- Проблемы: первый workflow_dispatch требует файла в default branch, а кодовые PR требуют явного «Claude одобрил» от владельца. Полные замечания и варианты записаны в PR; новый trigger не добавлялся. S5 и WhatsApp не выполнялись.
+- Что дальше и кому: владелец передаёт [T28 Claude](https://github.com/tsukixme/messenger/blob/main/docs/tasks/T28-Claude.md) и возвращает решение; Codex перепроверяет ответ и продолжает разрешённые операции. PR скриптов S3 #2 также включён в ревью.
+
+---
+
 ## 2026-10-02 · S3 · Codex
 - Сделано: сервер развёрнут на ВМ, строгий SSH по ключу работает. Четыре контейнера запущены, ngrok-токен и пароли введены самим владельцем скрытым вводом. Созданы admin и demo1–demo4; права независимо проверены. Созданы и проверены скрипты пользователей и резервных копий; [PR #2](https://github.com/tsukixme/messenger-server/pull/2) ожидает ревью. По просьбе владельца выключенная ВМ включена 2026-10-02.
 - Проверка: **принято в согласованном объёме S3**. Публичные login demo1/demo2, отправка demo1 и получение события demo2 через event API и /sync — HTTP 200. Временные сессии завершены, файл токенов удалён. Versions/health — 200, admin — 403, dev/message — 404, неподписанный webhook — 403. Итоговая копия с аккаунтами создана; хранятся пять, обе восстановленные SQLite-базы проходят integrity_check. Тесты auth: 13 passed. Подробности: [S3-codex.md](reports/S3-codex.md).
